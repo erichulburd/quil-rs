@@ -301,7 +301,7 @@ impl<'a> InstructionBlock<'a> {
         // Root node
         graph.add_node(ScheduledGraphNode::BlockStart);
 
-        let mut last_classical_instruction = ScheduledGraphNode::BlockStart;
+        let mut last_classical_instructions: HashMap<String, ScheduledGraphNode> = HashMap::new();
 
         // Store the instruction index of the last instruction to block that frame
         let mut last_instruction_by_frame: HashMap<FrameIdentifier, PreviousNodes> = HashMap::new();
@@ -318,9 +318,19 @@ impl<'a> InstructionBlock<'a> {
             match custom_handler.role_for_instruction(instruction) {
                 // Classical instructions must be ordered by appearance in the program
                 InstructionRole::ClassicalCompute => {
-                    add_dependency!(graph, last_classical_instruction => node, ExecutionDependency::StableOrdering);
+                    let memory_accesses = custom_handler.memory_accesses(instruction);
+                    let reads = memory_accesses.reads;
+                    for read in reads {
+                        let last_classical_instruction = last_classical_instructions
+                            .get(&read)
+                            .unwrap_or(&ScheduledGraphNode::BlockStart);
+                        add_dependency!(graph, *last_classical_instruction => node, ExecutionDependency::StableOrdering);
+                    }
 
-                    last_classical_instruction = node;
+                    let writes = memory_accesses.writes;
+                    for write in writes {
+                        last_classical_instructions.insert(write.clone(), node);
+                    }
                     Ok(())
                 }
                 InstructionRole::RFControl => {
@@ -411,7 +421,13 @@ impl<'a> InstructionBlock<'a> {
 
         // Link all pending dependency nodes to the end of the block, to ensure that the block
         // does not terminate until these are complete
-        add_dependency!(graph, last_classical_instruction => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
+        if last_classical_instructions.is_empty() {
+            add_dependency!(graph, ScheduledGraphNode::BlockStart => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
+        } else {
+            for last_classical_instruction in last_classical_instructions.values() {
+                add_dependency!(graph, *last_classical_instruction => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
+            }
+        }
 
         for previous_nodes in last_timed_instruction_by_frame.into_values() {
             for node in previous_nodes.into_hashset() {

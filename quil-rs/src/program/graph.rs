@@ -93,10 +93,6 @@ pub enum ExecutionDependency {
 /// A data structure to be used in the serializing of access to a memory region.
 /// This utility helps guarantee strong consistency in a single-writer, multiple-reader model.
 impl MemoryAccessQueue {
-    pub fn flush(mut self) -> Vec<MemoryAccessDependency> {
-        self.get_blocking_nodes(ScheduledGraphNode::BlockEnd, &MemoryAccessType::Capture)
-    }
-
     /// Register that a node wants access of the given type, while returning which accesses block
     /// the requested access.
     ///
@@ -301,7 +297,8 @@ impl<'a> InstructionBlock<'a> {
         // Root node
         graph.add_node(ScheduledGraphNode::BlockStart);
 
-        let mut last_classical_instructions: HashMap<String, ScheduledGraphNode> = HashMap::new();
+        // TODO
+        let mut trailing_classical_instructions: HashSet<ScheduledGraphNode> = HashSet::new();
 
         // Store the instruction index of the last instruction to block that frame
         let mut last_instruction_by_frame: HashMap<FrameIdentifier, PreviousNodes> = HashMap::new();
@@ -315,27 +312,50 @@ impl<'a> InstructionBlock<'a> {
         for (index, &instruction) in instructions.iter().enumerate() {
             let node = graph.add_node(ScheduledGraphNode::InstructionIndex(index));
 
+            let accesses = custom_handler.memory_accesses(instruction);
+
+            let memory_dependencies = [
+                (accesses.reads, MemoryAccessType::Read),
+                (accesses.writes, MemoryAccessType::Write),
+                (accesses.captures, MemoryAccessType::Capture),
+            ]
+            .iter()
+            .flat_map(|(regions, access_type)| {
+                regions
+                    .iter()
+                    .flat_map(|region| {
+                        pending_memory_access
+                            .entry(region.clone())
+                            .or_default()
+                            .get_blocking_nodes(node, access_type)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+            let has_memory_dependencies = !memory_dependencies.is_empty();
+            for memory_dependency in memory_dependencies {
+                // Test to make sure that no instructions depend directly on themselves
+                if memory_dependency.node_id != node {
+                    let execution_dependency =
+                        ExecutionDependency::AwaitMemoryAccess(memory_dependency.access_type);
+                    add_dependency!(graph, memory_dependency.node_id => node, execution_dependency);
+                    trailing_classical_instructions.remove(&memory_dependency.node_id);
+                }
+            }
+
             match custom_handler.role_for_instruction(instruction) {
                 // Classical instructions must be ordered by appearance in the program
                 InstructionRole::ClassicalCompute => {
-                    let memory_accesses = custom_handler.memory_accesses(instruction);
-                    let reads = memory_accesses.reads;
-                    for read in reads {
-                        let last_classical_instruction = last_classical_instructions
-                            .get(&read)
-                            .unwrap_or(&ScheduledGraphNode::BlockStart);
-                        add_dependency!(graph, *last_classical_instruction => node, ExecutionDependency::StableOrdering);
+                    if !has_memory_dependencies {
+                        add_dependency!(graph, ScheduledGraphNode::BlockStart => node, ExecutionDependency::StableOrdering);
                     }
-
-                    let writes = memory_accesses.writes;
-                    for write in writes {
-                        last_classical_instructions.insert(write.clone(), node);
-                    }
+                    trailing_classical_instructions.insert(node);
                     Ok(())
                 }
                 InstructionRole::RFControl => {
                     let matched_frames = custom_handler.matching_frames(instruction, program);
                     let is_scheduled = custom_handler.is_scheduled(instruction);
+                    let mut has_dependencies = false;
 
                     if let Some(matched_frames) = matched_frames {
                         for frame in matched_frames.used() {
@@ -346,6 +366,7 @@ impl<'a> InstructionBlock<'a> {
                                     .get_dependencies_for_next_user(node);
 
                                 for previous_node_id in previous_node_ids {
+                                    has_dependencies = true;
                                     add_dependency!(graph, previous_node_id => node, ExecutionDependency::Scheduled);
                                 }
                             }
@@ -356,6 +377,7 @@ impl<'a> InstructionBlock<'a> {
                                 .get_dependencies_for_next_user(node);
 
                             for previous_node_id in previous_node_ids {
+                                has_dependencies = true;
                                 add_dependency!(graph, previous_node_id => node, ExecutionDependency::StableOrdering);
                             }
                         }
@@ -367,6 +389,7 @@ impl<'a> InstructionBlock<'a> {
                                     .or_default()
                                     .get_dependency_for_next_blocker(node)
                                 {
+                                    has_dependencies = true;
                                     add_dependency!(graph, previous_node_id => node, ExecutionDependency::Scheduled);
                                 }
                             }
@@ -376,9 +399,13 @@ impl<'a> InstructionBlock<'a> {
                                 .or_default()
                                 .get_dependency_for_next_blocker(node)
                             {
+                                has_dependencies = true;
                                 add_dependency!(graph, previous_node_id => node, ExecutionDependency::StableOrdering);
                             }
                         }
+                    }
+                    if !has_dependencies && !has_memory_dependencies {
+                        add_dependency!(graph, ScheduledGraphNode::BlockStart => node, ExecutionDependency::StableOrdering);
                     }
 
                     Ok(())
@@ -394,39 +421,12 @@ impl<'a> InstructionBlock<'a> {
                     variant: ScheduleErrorVariant::UnschedulableInstruction,
                 }),
             }?;
-
-            let accesses = custom_handler.memory_accesses(instruction);
-            for (regions, access_type) in [
-                (accesses.reads, MemoryAccessType::Read),
-                (accesses.writes, MemoryAccessType::Write),
-                (accesses.captures, MemoryAccessType::Capture),
-            ] {
-                for region in regions {
-                    let memory_dependencies = pending_memory_access
-                        .entry(region.clone())
-                        .or_default()
-                        .get_blocking_nodes(node, &access_type);
-                    for memory_dependency in memory_dependencies {
-                        // Test to make sure that no instructions depend directly on themselves
-                        if memory_dependency.node_id != node {
-                            let execution_dependency = ExecutionDependency::AwaitMemoryAccess(
-                                memory_dependency.access_type,
-                            );
-                            add_dependency!(graph, memory_dependency.node_id => node, execution_dependency);
-                        }
-                    }
-                }
-            }
         }
 
         // Link all pending dependency nodes to the end of the block, to ensure that the block
         // does not terminate until these are complete
-        if last_classical_instructions.is_empty() {
-            add_dependency!(graph, ScheduledGraphNode::BlockStart => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
-        } else {
-            for last_classical_instruction in last_classical_instructions.values() {
-                add_dependency!(graph, *last_classical_instruction => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
-            }
+        for trailing_classical_instruction in trailing_classical_instructions {
+            add_dependency!(graph, trailing_classical_instruction => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
         }
 
         for previous_nodes in last_timed_instruction_by_frame.into_values() {
@@ -441,19 +441,8 @@ impl<'a> InstructionBlock<'a> {
             }
         }
 
-        // Examine all "pending" memory operations for all regions
-        let remaining_dependencies = pending_memory_access
-            .into_iter()
-            .flat_map(|(_, queue)| queue.flush())
-            .collect::<Vec<MemoryAccessDependency>>();
-
-        // For each dependency, insert or overwrite an edge in the graph connecting the node pending that
-        // operation to the end of the graph.
-        for dependency in remaining_dependencies {
-            let execution_dependency =
-                ExecutionDependency::AwaitMemoryAccess(dependency.access_type);
-
-            add_dependency!(graph, dependency.node_id => ScheduledGraphNode::BlockEnd, execution_dependency);
+        if instructions.is_empty() {
+            add_dependency!(graph, ScheduledGraphNode::BlockStart => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
         }
 
         Ok(InstructionBlock {
@@ -726,111 +715,7 @@ impl<'a> ScheduledProgram<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use petgraph::algo::{has_path_connecting, DfsSpace};
-    use rstest::rstest;
-    use std::str::FromStr;
-
-    const INSTRUCTION_BLOCK_BUILD_01: &str = "LOAD reals1[0] reals2 integers1[0]; MUL reals1[0] 2";
-    const INSTRUCTION_BLOCK_BUILD_02: &str =
-        "LOAD reals1[0] reals2 integers1[0]; SET-PHASE 0 \"rf\" reals1[0]";
-    const INSTRUCTION_BLOCK_BUILD_03: &str = "
-LOAD reals2[0] reals1 integers1[0]
-LOAD reals3[0] reals1 integers1[0]
-LOAD reals4[0] reals1 integers1[0]
-LOAD reals4[0] reals2 integers1[0]
-";
-    const INSTRUCTION_BLOCK_BUILD_04: &str = "
-LOAD reals2[0] reals1 integers1[0]
-LOAD reals3[0] reals1 integers1[0]
-LOAD reals4[0] reals1 integers1[0]
-SET-PHASE 0 \"rf\" reals2[0]
-";
-
-    fn format_block_build_test_case(body: &str) -> String {
-        format!(
-            "
-DECLARE reals1 REAL[10];
-DECLARE reals2 REAL[10];
-DECLARE reals3 REAL[10];
-DECLARE reals4 REAL[10];
-DECLARE integers1 INTEGER[10];
-
-{body}"
-        )
-    }
-
-    #[rstest]
-    #[case(INSTRUCTION_BLOCK_BUILD_01, vec![(0, 1)], vec![(1, 0)])]
-    #[case(INSTRUCTION_BLOCK_BUILD_02, vec![(0, 1)], vec![(1, 0)])]
-    #[case(INSTRUCTION_BLOCK_BUILD_03, vec![(0, 3)], vec![(1, 0), (2, 0)])]
-    #[case(INSTRUCTION_BLOCK_BUILD_04, vec![(0, 3)], vec![(1, 0), (2, 0)])]
-    fn test_instruction_block_build(
-        #[case] program: &str,
-        #[case] edges: Vec<(usize, usize)>,
-        #[case] non_edges: Vec<(usize, usize)>,
-    ) {
-        let program = Program::from_str(&format_block_build_test_case(program)).unwrap();
-
-        let mut custom_handler = InstructionHandler::default();
-        let block = InstructionBlock::build(
-            program.body_instructions().collect(),
-            None,
-            &program,
-            &mut custom_handler,
-        )
-        .unwrap();
-        let mut space = DfsSpace::new(&block.graph);
-
-        for node in block.graph.nodes() {
-            assert!(
-                has_path_connecting(
-                    &block.graph,
-                    ScheduledGraphNode::BlockStart,
-                    node,
-                    Some(&mut space),
-                ),
-                "Node {:?} is unreachable from the block start",
-                node
-            );
-            assert!(
-                has_path_connecting(
-                    &block.graph,
-                    node,
-                    ScheduledGraphNode::BlockEnd,
-                    Some(&mut space),
-                ),
-                "Block end is unreachable from node {:?}",
-                node
-            );
-        }
-
-        for edge in edges {
-            assert!(
-                has_path_connecting(
-                    &block.graph,
-                    ScheduledGraphNode::InstructionIndex(edge.0),
-                    ScheduledGraphNode::InstructionIndex(edge.1),
-                    Some(&mut space),
-                ),
-                "No path from node {:?} to node {:?}",
-                edge.0,
-                edge.1
-            );
-        }
-        for edge in non_edges {
-            assert!(
-                !has_path_connecting(
-                    &block.graph,
-                    ScheduledGraphNode::InstructionIndex(edge.0),
-                    ScheduledGraphNode::InstructionIndex(edge.1),
-                    Some(&mut space),
-                ),
-                "Unexpected path from node {:?} to node {:?}",
-                edge.0,
-                edge.1
-            );
-        }
-    }
+    use crate::program::graphviz_dot::tests::build_dot_format_snapshot_test_case;
 
     #[cfg(feature = "graphviz-dot")]
     mod custom_handler {
@@ -839,7 +724,7 @@ DECLARE integers1 INTEGER[10];
         use crate::instruction::Pragma;
         use crate::instruction::PragmaArgument;
         use crate::program::frame::FrameMatchCondition;
-        use crate::program::graphviz_dot::tests::build_dot_format_snapshot_test_case;
+
         use crate::program::{MatchedFrames, MemoryAccesses};
 
         /// Generates a custom [`InstructionHandler`] that specially handles two `PRAGMA` instructions:
@@ -976,5 +861,125 @@ PRAGMA RAW-INSTRUCTION foo
 "#,
             &mut get_custom_handler(),
         }
+    }
+
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // we expect an edge from the first load to the second (0 -> 1).
+    build_dot_format_snapshot_test_case! {
+        classical_write_read_load_load,
+        r#"
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE params3 REAL[1]
+DECLARE integers INTEGER[1]
+LOAD params2[0] params3 integers[0] # just writes params2 
+LOAD params1[0] params2 integers[0] # just reads params2
+"#
+    }
+
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // we expect an edge from the mul to the load (0 -> 1).
+    build_dot_format_snapshot_test_case! {
+        classical_write_read_mul_load,
+        r#"
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE integers INTEGER[1]
+
+MUL params2[0] 2 # reads and writes params2
+LOAD params1[0] params2 integers[0] # just reads params2
+"#
+    }
+
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // we expect an edge from the mul to the add (0 -> 1).
+    build_dot_format_snapshot_test_case! {
+        classical_write_read_add_mul,
+        r#"
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE integers INTEGER[1]
+
+ADD params1[0] 1 # this reads and writes params1
+MUL params1[0] 2 # this reads and writes params1
+"#
+    }
+
+    // Because any instruction that reads a particular region must precede any later instructions that write/ capture to that memory region,
+    // we expect an edge from the first load to the second (0, 1).
+    build_dot_format_snapshot_test_case! {
+        classical_read_write_load_load,
+        r#"
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE integers INTEGER[1]
+
+LOAD params1[0] params2 integers[0] # just reads params2
+LOAD params2[0] params3 integers[0] # just writes params2
+"#
+    }
+
+    // Because any instruction that reads a particular region must precede any later instructions that write/ capture to that memory region,
+    // we expect an edge from the load to the mul (0, 1).
+    build_dot_format_snapshot_test_case! {
+        classical_read_write_load_mul,
+        r#"
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE integers INTEGER[1]
+
+LOAD params1[0] params2 integers[0] # just reads params2
+MUL params2[0] 2 # reads and writes params2
+"#
+    }
+
+    // FIXME: The concern here is write-read
+    build_dot_format_snapshot_test_case! {
+        quantum_write_parameterized_operations,
+        r#"
+DEFFRAME 0 "rx":
+    INITIAL-FREQUENCY: 1e8
+DEFFRAME 1 "rx":
+    INITIAL-FREQUENCY: 1e8
+
+DECLARE params1 REAL[1]
+DECLARE params2 REAL[1]
+DECLARE integers INTEGER[1]
+
+LOAD params2[0] params1 integers[0] # writes to params2
+SHIFT-PHASE 0 "rf" params2[0]
+LOAD params2[0] params1 integers[1] # writes to params2
+SHIFT-PHASE 1 "rf" params2[0]
+"#
+    }
+
+    // Because a pragma will have no memory accesses, it should only have edges from the block start and to the block end.
+    build_dot_format_snapshot_test_case! {
+        classical_no_memory_pragma,
+        r#"PRAGMA blah"#
+    }
+
+    build_dot_format_snapshot_test_case! {
+        write_capture_read,
+        r#"
+DECLARE bits BIT[1]
+DECLARE integers INTEGER[1]
+LOAD bits[0] bits2 integers[0] # write
+NONBLOCKING CAPTURE 0 "Transmon-0_readout_rx" flat(duration: 2.0000000000000003e-06, iq: 1.0, scale: 1.0, phase: 0.8745492960861506, detuning: 0.0) bits[0] # capture
+LOAD bits3[0] bits integers[0] # read
+"#
+    }
+
+    build_dot_format_snapshot_test_case! {
+        write_write_read,
+        r#"
+DECLARE bits BIT[1]
+DECLARE bits2 BIT[1]
+DECLARE bits3 BIT[1]
+DECLARE integers INTEGER[1]
+LOAD bits[0] bits2 integers[0] # write
+LOAD bits[0] bits3 integers[0] # write
+LOAD bits4[0] bits integers[0] # read
+"#
     }
 }

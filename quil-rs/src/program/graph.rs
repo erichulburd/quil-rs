@@ -726,16 +726,121 @@ impl<'a> ScheduledProgram<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::Pragma;
-    use crate::program::{MatchedFrames, MemoryAccesses};
+    use petgraph::algo::{has_path_connecting, DfsSpace};
+    use rstest::rstest;
+    use std::str::FromStr;
+
+    const INSTRUCTION_BLOCK_BUILD_01: &str = "LOAD reals1[0] reals2 integers1[0]; MUL reals1[0] 2";
+    const INSTRUCTION_BLOCK_BUILD_02: &str =
+        "LOAD reals1[0] reals2 integers1[0]; SET-PHASE 0 \"rf\" reals1[0]";
+    const INSTRUCTION_BLOCK_BUILD_03: &str = "
+LOAD reals2[0] reals1 integers1[0]
+LOAD reals3[0] reals1 integers1[0]
+LOAD reals4[0] reals1 integers1[0]
+LOAD reals4[0] reals2 integers1[0]
+";
+    const INSTRUCTION_BLOCK_BUILD_04: &str = "
+LOAD reals2[0] reals1 integers1[0]
+LOAD reals3[0] reals1 integers1[0]
+LOAD reals4[0] reals1 integers1[0]
+SET-PHASE 0 \"rf\" reals2[0]
+";
+
+    fn format_block_build_test_case(body: &str) -> String {
+        format!(
+            "
+DECLARE reals1 REAL[10];
+DECLARE reals2 REAL[10];
+DECLARE reals3 REAL[10];
+DECLARE reals4 REAL[10];
+DECLARE integers1 INTEGER[10];
+
+{body}"
+        )
+    }
+
+    #[rstest]
+    #[case(INSTRUCTION_BLOCK_BUILD_01, vec![(0, 1)], vec![(1, 0)])]
+    #[case(INSTRUCTION_BLOCK_BUILD_02, vec![(0, 1)], vec![(1, 0)])]
+    #[case(INSTRUCTION_BLOCK_BUILD_03, vec![(0, 3)], vec![(1, 0), (2, 0)])]
+    #[case(INSTRUCTION_BLOCK_BUILD_04, vec![(0, 3)], vec![(1, 0), (2, 0)])]
+    fn test_instruction_block_build(
+        #[case] program: &str,
+        #[case] edges: Vec<(usize, usize)>,
+        #[case] non_edges: Vec<(usize, usize)>,
+    ) {
+        let program = Program::from_str(&format_block_build_test_case(program)).unwrap();
+
+        let mut custom_handler = InstructionHandler::default();
+        let block = InstructionBlock::build(
+            program.body_instructions().collect(),
+            None,
+            &program,
+            &mut custom_handler,
+        )
+        .unwrap();
+        let mut space = DfsSpace::new(&block.graph);
+
+        for node in block.graph.nodes() {
+            assert!(
+                has_path_connecting(
+                    &block.graph,
+                    ScheduledGraphNode::BlockStart,
+                    node,
+                    Some(&mut space),
+                ),
+                "Node {:?} is unreachable from the block start",
+                node
+            );
+            assert!(
+                has_path_connecting(
+                    &block.graph,
+                    node,
+                    ScheduledGraphNode::BlockEnd,
+                    Some(&mut space),
+                ),
+                "Block end is unreachable from node {:?}",
+                node
+            );
+        }
+
+        for edge in edges {
+            assert!(
+                has_path_connecting(
+                    &block.graph,
+                    ScheduledGraphNode::InstructionIndex(edge.0),
+                    ScheduledGraphNode::InstructionIndex(edge.1),
+                    Some(&mut space),
+                ),
+                "No path from node {:?} to node {:?}",
+                edge.0,
+                edge.1
+            );
+        }
+        for edge in non_edges {
+            assert!(
+                !has_path_connecting(
+                    &block.graph,
+                    ScheduledGraphNode::InstructionIndex(edge.0),
+                    ScheduledGraphNode::InstructionIndex(edge.1),
+                    Some(&mut space),
+                ),
+                "Unexpected path from node {:?} to node {:?}",
+                edge.0,
+                edge.1
+            );
+        }
+    }
 
     #[cfg(feature = "graphviz-dot")]
     mod custom_handler {
         use super::*;
 
+        use crate::instruction::Pragma;
         use crate::instruction::PragmaArgument;
         use crate::program::frame::FrameMatchCondition;
         use crate::program::graphviz_dot::tests::build_dot_format_snapshot_test_case;
+        use crate::program::{MatchedFrames, MemoryAccesses};
 
         /// Generates a custom [`InstructionHandler`] that specially handles two `PRAGMA` instructions:
         ///

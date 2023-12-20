@@ -297,7 +297,9 @@ impl<'a> InstructionBlock<'a> {
         // Root node
         graph.add_node(ScheduledGraphNode::BlockStart);
 
-        // TODO
+        // The set of classical instructions that do not have outgoing edges (i.e. there are no
+        // downstream instructions that depend on them). After iterating over all instructions,
+        // the set of trailing classical instructions will need an outgoing edge to the block end.
         let mut trailing_classical_instructions: HashSet<ScheduledGraphNode> = HashSet::new();
 
         // Store the instruction index of the last instruction to block that frame
@@ -327,6 +329,8 @@ impl<'a> InstructionBlock<'a> {
                         pending_memory_access
                             .entry(region.clone())
                             .or_default()
+                            // NOTE: This mutates the underlying `MemoryAccessQueue` by registering
+                            // the instruction node.
                             .get_blocking_nodes(node, access_type)
                     })
                     .collect::<Vec<_>>()
@@ -339,6 +343,9 @@ impl<'a> InstructionBlock<'a> {
                     let execution_dependency =
                         ExecutionDependency::AwaitMemoryAccess(memory_dependency.access_type);
                     add_dependency!(graph, memory_dependency.node_id => node, execution_dependency);
+                    // This memory dependency now has an outgoing edge, so it is no longer a trailing classical
+                    // instruction. If the memory dependency is not a classical instruction, this
+                    // has no effect.
                     trailing_classical_instructions.remove(&memory_dependency.node_id);
                 }
             }
@@ -346,6 +353,8 @@ impl<'a> InstructionBlock<'a> {
             match custom_handler.role_for_instruction(instruction) {
                 // Classical instructions must be ordered by appearance in the program
                 InstructionRole::ClassicalCompute => {
+                    // If this instruction has no memory dependencies, it is a leading classical
+                    // instruction and needs an incoming edge from the block start.
                     if !has_memory_dependencies {
                         add_dependency!(graph, ScheduledGraphNode::BlockStart => node, ExecutionDependency::StableOrdering);
                     }
@@ -355,7 +364,6 @@ impl<'a> InstructionBlock<'a> {
                 InstructionRole::RFControl => {
                     let matched_frames = custom_handler.matching_frames(instruction, program);
                     let is_scheduled = custom_handler.is_scheduled(instruction);
-                    let mut has_dependencies = false;
 
                     if let Some(matched_frames) = matched_frames {
                         for frame in matched_frames.used() {
@@ -366,7 +374,6 @@ impl<'a> InstructionBlock<'a> {
                                     .get_dependencies_for_next_user(node);
 
                                 for previous_node_id in previous_node_ids {
-                                    has_dependencies = true;
                                     add_dependency!(graph, previous_node_id => node, ExecutionDependency::Scheduled);
                                 }
                             }
@@ -377,7 +384,6 @@ impl<'a> InstructionBlock<'a> {
                                 .get_dependencies_for_next_user(node);
 
                             for previous_node_id in previous_node_ids {
-                                has_dependencies = true;
                                 add_dependency!(graph, previous_node_id => node, ExecutionDependency::StableOrdering);
                             }
                         }
@@ -389,7 +395,6 @@ impl<'a> InstructionBlock<'a> {
                                     .or_default()
                                     .get_dependency_for_next_blocker(node)
                                 {
-                                    has_dependencies = true;
                                     add_dependency!(graph, previous_node_id => node, ExecutionDependency::Scheduled);
                                 }
                             }
@@ -399,13 +404,9 @@ impl<'a> InstructionBlock<'a> {
                                 .or_default()
                                 .get_dependency_for_next_blocker(node)
                             {
-                                has_dependencies = true;
                                 add_dependency!(graph, previous_node_id => node, ExecutionDependency::StableOrdering);
                             }
                         }
-                    }
-                    if !has_dependencies && !has_memory_dependencies {
-                        add_dependency!(graph, ScheduledGraphNode::BlockStart => node, ExecutionDependency::StableOrdering);
                     }
 
                     Ok(())
@@ -441,6 +442,7 @@ impl<'a> InstructionBlock<'a> {
             }
         }
 
+        // Maintain the invariant that the block start node has a connecting path to the block end node.
         if instructions.is_empty() {
             add_dependency!(graph, ScheduledGraphNode::BlockStart => ScheduledGraphNode::BlockEnd, ExecutionDependency::StableOrdering);
         }
@@ -863,7 +865,7 @@ PRAGMA RAW-INSTRUCTION foo
         }
     }
 
-    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write to/ capture that memory region,
     // we expect an edge from the first load to the second (0 -> 1).
     build_dot_format_snapshot_test_case! {
         classical_write_read_load_load,
@@ -872,12 +874,12 @@ DECLARE params1 REAL[1]
 DECLARE params2 REAL[1]
 DECLARE params3 REAL[1]
 DECLARE integers INTEGER[1]
-LOAD params2[0] params3 integers[0] # just writes params2 
-LOAD params1[0] params2 integers[0] # just reads params2
+LOAD params2[0] params3 integers[0] # writes params2 
+LOAD params1[0] params2 integers[0] # reads params2
 "#
     }
 
-    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write to/ capture that memory region,
     // we expect an edge from the mul to the load (0 -> 1).
     build_dot_format_snapshot_test_case! {
         classical_write_read_mul_load,
@@ -891,7 +893,7 @@ LOAD params1[0] params2 integers[0] # just reads params2
 "#
     }
 
-    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write/ capture to that memory region,
+    // Because any instruction that reads a particular region must be preceded by any earlier instructions that write to/ capture that memory region,
     // we expect an edge from the mul to the add (0 -> 1).
     build_dot_format_snapshot_test_case! {
         classical_write_read_add_mul,
@@ -905,7 +907,7 @@ MUL params1[0] 2 # this reads and writes params1
 "#
     }
 
-    // Because any instruction that reads a particular region must precede any later instructions that write/ capture to that memory region,
+    // Because any instruction that reads a particular region must precede any later instructions that write to/ capture that memory region,
     // we expect an edge from the first load to the second (0, 1).
     build_dot_format_snapshot_test_case! {
         classical_read_write_load_load,
@@ -914,12 +916,12 @@ DECLARE params1 REAL[1]
 DECLARE params2 REAL[1]
 DECLARE integers INTEGER[1]
 
-LOAD params1[0] params2 integers[0] # just reads params2
-LOAD params2[0] params3 integers[0] # just writes params2
+LOAD params1[0] params2 integers[0] # reads params2
+LOAD params2[0] params3 integers[0] # writes params2
 "#
     }
 
-    // Because any instruction that reads a particular region must precede any later instructions that write/ capture to that memory region,
+    // Because any instruction that reads a particular region must precede any later instructions that write to/ capture that memory region,
     // we expect an edge from the load to the mul (0, 1).
     build_dot_format_snapshot_test_case! {
         classical_read_write_load_mul,
@@ -928,12 +930,14 @@ DECLARE params1 REAL[1]
 DECLARE params2 REAL[1]
 DECLARE integers INTEGER[1]
 
-LOAD params1[0] params2 integers[0] # just reads params2
-MUL params2[0] 2 # reads and writes params2
+LOAD params1[0] params2 integers[0] # reads params2
+MUL params2[0] 2                    # reads and writes params2
 "#
     }
 
-    // FIXME: The concern here is write-read
+    // Because memory reading and writing dependencies also apply to RfControl instructions, we
+    // expect edges from the first load to the first shift-phase (0 -> 1), the first shift-phase
+    // to the second load (1 -> 2), and the second load to the second shift-phase (2 -> 3).
     build_dot_format_snapshot_test_case! {
         quantum_write_parameterized_operations,
         r#"
@@ -946,17 +950,17 @@ DECLARE params1 REAL[1]
 DECLARE params2 REAL[1]
 DECLARE integers INTEGER[1]
 
-LOAD params2[0] params1 integers[0] # writes to params2
-SHIFT-PHASE 0 "rf" params2[0]
-LOAD params2[0] params1 integers[1] # writes to params2
-SHIFT-PHASE 1 "rf" params2[0]
+LOAD params2[0] params1 integers[0] # writes params2
+SHIFT-PHASE 0 "rf" params2[0]       # reads params2
+LOAD params2[0] params1 integers[1] # writes params2
+SHIFT-PHASE 1 "rf" params2[0]       # reads params2
 "#
     }
 
-    // Because a pragma will have no memory accesses, it should only have edges from the block start and to the block end.
+    // Because a pragma by default will have no memory accesses, it should only have edges from the block start and to the block end.
     build_dot_format_snapshot_test_case! {
         classical_no_memory_pragma,
-        r#"PRAGMA blah"#
+        r#"PRAGMA example"#
     }
 
     build_dot_format_snapshot_test_case! {
